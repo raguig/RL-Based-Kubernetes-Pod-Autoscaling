@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Raw datasets (~18 GB) - download separately, see README
+data/**
+!data/
+!data/alibaba/
+!data/alibaba_microservices/
+!data/gwat/
+!data/*/*.npz
+
+# Training logs (TensorBoard) and local tool logs
+logs/
+.codex-*.log
+
+# Office lock files / OS junk
+~$*
+Thumbs.db
+.DS_Store

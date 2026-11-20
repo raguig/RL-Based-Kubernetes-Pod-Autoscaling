@@ -1,0 +1,1477 @@
+\documentclass{rapportINPTCLOUD}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage[a4paper,top=2.4cm,bottom=2.5cm,left=2.5cm,right=2.5cm]{geometry}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{setspace}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{listings}
+\usepackage{titlesec}
+\usepackage{csquotes}
+\usepackage{biblatex}
+\usepackage{appendix}
+\usepackage{hyperref}
+
+\addbibresource{bibtex.bib}
+
+\definecolor{codebg}{HTML}{F5F5F5}
+\definecolor{sectionblue}{HTML}{1F4E79}
+
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcommand{\pathcode}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\best}[1]{\textbf{#1}}
+
+\captionsetup{font=small,labelfont=bf}
+\setlist[itemize]{leftmargin=*,itemsep=2pt,topsep=4pt}
+\setlist[enumerate]{leftmargin=*,itemsep=2pt,topsep=4pt}
+\renewcommand{\arraystretch}{1.15}
+\setlength{\tabcolsep}{5pt}
+\onehalfspacing
+\raggedbottom
+\sloppy
+
+\titleformat{\chapter}[display]
+  {\normalfont\huge\bfseries\color{sectionblue}}
+  {\filleft Chapter \thechapter}
+  {0.4em}
+  {\titlerule[0.8pt]\vspace{0.8em}\filright}
+\titlespacing*{\chapter}{0pt}{-8pt}{28pt}
+
+\titleformat{\section}
+  {\normalfont\Large\bfseries\color{sectionblue}}
+  {\thesection}
+  {0.8em}
+  {}
+\titlespacing*{\section}{0pt}{18pt}{8pt}
+
+\titleformat{\subsection}
+  {\normalfont\large\bfseries}
+  {\thesubsection}
+  {0.8em}
+  {}
+\titlespacing*{\subsection}{0pt}{12pt}{6pt}
+
+\lstset{
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  framerule=0.3pt,
+  framesep=6pt,
+  showstringspaces=false,
+  columns=fullflexible
+}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=sectionblue,
+  urlcolor=sectionblue
+}
+
+\setcounter{tocdepth}{2}
+\setcounter{secnumdepth}{3}
+
+\title{Rapport de Stage}
+
+\begin{document}
+
+\titre{Reinforcement-Learning-Based Pod Autoscaling in Kubernetes}
+\sujet{A Multi-Dataset MDP Benchmark with DQN, DDPG, SAC, TD3, and PPO}
+\Encadrants{Mr. Ahmed \textsc{HADRI}\\Prof. Driss \textsc{ALLAKI}}
+\eleves{Mohammed Amine \textsc{RAGUIG}}
+
+\fairemarges
+\fairepagedegarde
+\tabledematieres
+\clearpage
+\listoftables
+\clearpage
+
+% ============================================================
+\chapter*{Acknowledgements}
+\addcontentsline{toc}{chapter}{Acknowledgements}
+
+I would like to express my sincere gratitude to Mr. Ahmed Hadri for his day-to-day supervision during this internship. He guided the technical discussions, helped define the experimental direction, and followed the main decisions related to datasets, algorithms, and interpretation of results.
+
+I would also like to thank Professor Driss Allaki for his academic supervision and for the broader framing of the internship within reinforcement learning and cloud systems. I am grateful to the SEEDS research team at INPT for the working environment and for the opportunity to develop this project.
+
+% ============================================================
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+
+Kubernetes provides the Horizontal Pod Autoscaler (HPA) as a standard mechanism for changing the number of pod replicas according to observed metrics such as CPU utilization. HPA is simple, reliable, and widely used, but it is reactive by design. It does not learn from historical workload behavior, and it does not explicitly optimize a multi-objective trade-off between service-level agreement compliance, resource cost, and scaling stability.
+
+This internship project studies whether reinforcement learning can be used to design a stronger pod autoscaling policy. The autoscaling problem is formalized as a Markov Decision Process. The agent observes a short history of load, the current latency, CPU utilization, and replica count, then selects a scaling action. The reward function penalizes latency above a 200 ms target, the cost of running replicas, and the instability caused by frequent replica changes.
+
+The project implements a Gymnasium-compatible simulation environment, dataset preprocessing pipelines, training scripts, and evaluation scripts. Five workload sources are used: a synthetic sinusoidal workload, Azure Functions invocation traces, Alibaba machine utilization traces, Alibaba microservice traces, and GWA-T/Bitbrains virtual-machine traces. The algorithms compared are Random, HPA, DQN, DDPG, Tuned DDPG, SAC, TD3, PPO Discrete, and PPO Delta.
+
+The results show that reinforcement learning can outperform HPA, but only when the action space and training setup match the structure of autoscaling. Original DDPG collapses into boundary policies because it outputs absolute replica counts directly. Tuned DDPG fixes this through bounded delta actions, normalization, and more stable hyperparameters. SAC gives the strongest overall benchmark results, followed closely by TD3 and Tuned DDPG. PPO is stable and competitive but often uses more replicas. DQN is a useful discrete baseline, but it is sensitive to reward weights and workload burstiness.
+
+% ============================================================
+\chapter{Introduction}
+\label{chap:introduction}
+
+\section{Context}
+
+Modern cloud applications are usually deployed as collections of small services rather than as a single monolithic application. Kubernetes has become a dominant orchestration platform for running these services because it automates deployment, service discovery, rolling updates, failure recovery, and scaling. One of the most important scaling mechanisms is horizontal pod autoscaling, where the platform increases or decreases the number of running pod replicas according to observed demand.
+
+The default Kubernetes Horizontal Pod Autoscaler is based on a control-loop principle. At regular intervals, it reads a metric such as CPU utilization and compares it with a target value. If utilization is higher than the target, it increases the number of replicas. If utilization is lower than the target, it decreases the number of replicas. The core formula is:
+
+\begin{equation}
+N_{\text{desired}} =
+\left\lceil
+N_{\text{current}}
+\times
+\frac{M_{\text{current}}}{M_{\text{target}}}
+\right\rceil ,
+\label{eq:hpa}
+\end{equation}
+
+where $N_{\text{current}}$ is the current number of replicas, $M_{\text{current}}$ is the current metric value, and $M_{\text{target}}$ is the desired metric value \cite{kubernetesHPA}.
+
+This approach is practical and easy to deploy. It is also limited. It reacts to current pressure after the pressure has already appeared. It does not explicitly consider latency, future workload, cost, or scaling instability as a combined objective. These limitations motivate the use of reinforcement learning, where an agent can learn a policy from repeated interaction with an environment.
+
+\section{Problem Statement}
+
+The problem addressed in this project is the following:
+
+\begin{quote}
+Can a reinforcement-learning agent learn a pod autoscaling policy that improves the trade-off between SLA compliance, resource cost, and scaling stability compared with HPA?
+\end{quote}
+
+This question is difficult because autoscaling is not a one-step prediction problem. A scaling decision affects the next system state, the next latency, the next CPU utilization, and the future cost of the deployment. Scaling too late causes SLA violations. Scaling too aggressively wastes resources. Scaling too often creates instability. The controller must therefore learn sequential decision-making behavior rather than only predict the next workload value.
+
+\section{Objectives}
+
+The project objectives are:
+
+\begin{itemize}
+  \item formalize Kubernetes pod autoscaling as a Markov Decision Process;
+  \item implement a Gymnasium-compatible autoscaling simulator;
+  \item define a reward function that combines SLA violation, cost, and churn;
+  \item train and evaluate several reinforcement-learning algorithms;
+  \item compare learned policies against Random and HPA baselines;
+  \item test the policies across synthetic and real workload datasets;
+  \item analyze why some algorithms succeed while others fail.
+\end{itemize}
+
+\section{Main Contributions}
+
+The final project contributes:
+
+\begin{itemize}
+  \item a unified autoscaling environment with discrete actions, continuous absolute actions, and continuous delta actions;
+  \item dataset loaders for Azure Functions, Alibaba machine traces, Alibaba microservice traces, and GWA-T/Bitbrains traces;
+  \item training scripts for DQN, DDPG, Tuned DDPG, SAC, TD3, PPO Discrete, and PPO Delta;
+  \item evaluation scripts that report reward, SLA violation, cost, and churn;
+  \item a multi-dataset benchmark showing that SAC, TD3, Tuned DDPG, and PPO can outperform HPA under the same reward function.
+\end{itemize}
+
+\section{Report Organization}
+
+Chapter~\ref{chap:background} presents the background on Kubernetes autoscaling and reinforcement learning. Chapter~\ref{chap:project-management} explains the project workflow. Chapter~\ref{chap:mdp} defines the MDP used in the project. Chapter~\ref{chap:data} describes the datasets and preprocessing. Chapter~\ref{chap:algorithms} explains each algorithm and the mathematics behind it. Chapter~\ref{chap:implementation} presents the implementation. Chapter~\ref{chap:results} gives the benchmark results. Chapter~\ref{chap:discussion} discusses the results and limitations. Chapter~\ref{chap:future} lists future work. Chapter~\ref{chap:conclusion} concludes the report.
+
+% ============================================================
+\chapter{Background and Related Work}
+\label{chap:background}
+
+\section{Kubernetes Autoscaling}
+
+Kubernetes supports several forms of autoscaling:
+
+\begin{itemize}
+  \item Horizontal Pod Autoscaler, which changes the number of pod replicas;
+  \item Vertical Pod Autoscaler, which adjusts CPU and memory requests;
+  \item Cluster Autoscaler, which changes the number of cluster nodes.
+\end{itemize}
+
+This report focuses on horizontal pod autoscaling. HPA is a strong baseline because CPU pressure is often correlated with application load. However, HPA has no learning mechanism. It applies the same formula regardless of whether the service is smooth, bursty, cost-sensitive, or latency-critical. HPA also does not optimize the exact reward used in this project. It is therefore possible for a learned policy to beat HPA when the learned policy captures a better trade-off among several objectives.
+
+\section{Reinforcement Learning Concepts}
+
+In reinforcement learning, an agent interacts with an environment over time. At timestep $t$, the agent observes state $s_t$, selects action $a_t$, receives reward $r_t$, and observes the next state $s_{t+1}$. The objective is to maximize the expected discounted return:
+
+\begin{equation}
+G_t =
+\sum_{k=0}^{\infty} \gamma^k r_{t+k+1},
+\label{eq:return}
+\end{equation}
+
+where $\gamma \in [0,1]$ is the discount factor. A high value of $\gamma$ means that the agent cares about long-term consequences. In this project, $\gamma=0.99$ is used for the learning algorithms.
+
+The Markov property states that the current state should contain enough information to predict the distribution of the next state and reward:
+
+\begin{equation}
+P(s_{t+1},r_t \mid s_t,a_t)
+=
+P(s_{t+1},r_t \mid s_0,a_0,\ldots,s_t,a_t).
+\end{equation}
+
+In autoscaling, a single load value is not enough to approximate this property. The agent needs recent load history, current latency, current CPU utilization, and the current replica count.
+
+\section{Related Work}
+
+Previous research has studied autoscaling with rule-based systems, predictive models, and reinforcement learning. HPA represents the rule-based family: it is reliable, simple, and widely deployed, but it remains reactive. Predictive autoscalers use time-series forecasting to anticipate future load, but they normally require an additional control rule to translate predictions into replica counts.
+
+Reinforcement-learning approaches aim to learn the control rule directly. The original DQN work introduced the use of deep neural networks for value-based reinforcement learning with replay buffers and target networks \cite{mnih2015}. DDPG extended actor-critic ideas to continuous action spaces \cite{lillicrap2016}. SAC, TD3, and PPO later improved stability and exploration for continuous-control and policy-gradient problems \cite{haarnoja2018,fujimoto2018,schulman2017}.
+
+Autoscaling-specific work also motivates this project. Gym-HPA studies reinforcement learning for Kubernetes horizontal autoscaling in microservice applications and highlights the importance of considering service dependencies \cite{gymhpa}. NimbusGuard combines DQN with workload forecasting for proactive Kubernetes autoscaling \cite{nimbusguard}. Pandey studies reinforcement-learning autoscaling for cost and performance optimization in Kubernetes clusters \cite{pandey}. Multi-agent approaches such as the KARMA-related work show that autoscaling can also be decomposed into multiple resilience sub-goals \cite{soule2025karma}. This project remains single-agent and focuses on the SLA, cost, and churn trade-off.
+
+% ============================================================
+\chapter{Internship Context and Project Management}
+\label{chap:project-management}
+
+\section{Initial Scope}
+
+The initial internship scope was centered on DQN and DDPG. The planned work included a literature review, an MDP specification, a Gymnasium environment, a random baseline, an HPA baseline, DQN training, DDPG training, and a final comparison on real traces.
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lY}
+\toprule
+\textbf{Phase} & \textbf{Planned deliverable} \\
+\midrule
+Literature review & Study reinforcement learning, Kubernetes autoscaling, and prior RL autoscaling work. \\
+MDP design & Define state, action, transition, reward, discount factor, and episode structure. \\
+Environment & Implement a Gymnasium simulator for pod autoscaling. \\
+Baselines & Implement Random and HPA policies. \\
+Learning agents & Train DQN and DDPG agents. \\
+Evaluation & Compare agents using reward, SLA violation, cost, and churn. \\
+\bottomrule
+\end{tabularx}
+\caption{Initial internship scope}
+\end{table}
+
+\section{Scope Evolution}
+
+The scope expanded after the first DDPG and DQN results. Original DDPG collapsed into boundary behavior, and DQN was sensitive to the stability term in the reward. Instead of stopping at this point, the project added:
+
+\begin{itemize}
+  \item Tuned DDPG, to test whether the DDPG failure was caused by the algorithm or by the implementation choices;
+  \item SAC and TD3, to compare DDPG with more stable continuous-control methods;
+  \item PPO Discrete and PPO Delta, to test a stable on-policy policy-gradient family;
+  \item Alibaba machine, Alibaba microservice, and GWA-T datasets, to test whether the conclusions generalized beyond Azure traces.
+\end{itemize}
+
+This expansion made the project more complete as a research benchmark. It also made the main conclusion more precise: reinforcement learning can outperform HPA, but action design, normalization, and reward tuning are central to success.
+
+\section{Tools}
+
+The implementation uses Python, Gymnasium, Stable-Baselines3, NumPy, Pandas, Matplotlib, and TensorBoard. Gymnasium provides the environment interface. Stable-Baselines3 provides the DQN, DDPG, SAC, TD3, and PPO implementations. NumPy and Pandas handle workload preprocessing. Matplotlib is used for plots. TensorBoard is used to inspect training progress.
+
+% ============================================================
+\chapter{MDP Formulation}
+\label{chap:mdp}
+
+\section{Global MDP Definition}
+
+The autoscaling problem is defined as:
+
+\begin{equation}
+\mathcal{M} = \langle \mathcal{S}, \mathcal{A}, \mathcal{P}, \mathcal{R}, \gamma \rangle .
+\end{equation}
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lY}
+\toprule
+\textbf{Component} & \textbf{Definition in this project} \\
+\midrule
+$\mathcal{S}$ & State space containing recent load, latency, CPU utilization, and current replicas. \\
+$\mathcal{A}$ & Scaling action: discrete delta, continuous absolute target, or continuous delta. \\
+$\mathcal{P}$ & Simulator transition: apply action, move to next load value, compute CPU and latency. \\
+$\mathcal{R}$ & Reward function penalizing SLA violation, cost, and scaling churn. \\
+$\gamma$ & Reinforcement-learning discount factor, set to 0.99. \\
+\bottomrule
+\end{tabularx}
+\caption{MDP components}
+\end{table}
+
+\section{State Space}
+
+The implemented observation is:
+
+\begin{equation}
+s_t =
+\left(
+L_{t-4}, L_{t-3}, L_{t-2}, L_{t-1}, L_t,
+\lambda_t,
+C_t,
+N_t
+\right),
+\label{eq:state}
+\end{equation}
+
+where:
+
+\begin{itemize}
+  \item $L_t$ is the workload at timestep $t$;
+  \item $\lambda_t$ is the latency;
+  \item $C_t$ is CPU utilization;
+  \item $N_t$ is the current number of replicas.
+\end{itemize}
+
+The history window is important because load direction matters. A load value of 600 is not enough by itself. If the previous values were 300, 400, and 500, the workload is rising. If the previous values were 900, 800, and 700, the workload is falling. The same current load can therefore require different scaling decisions.
+
+\section{Action Spaces}
+
+Three action-space designs are implemented.
+
+\subsection{Discrete Delta Actions}
+
+DQN and PPO Discrete use:
+
+\begin{equation}
+\mathcal{A}_{\text{disc}} =
+\{-2,-1,0,+1,+2\}.
+\end{equation}
+
+The action is a replica change:
+
+\begin{equation}
+N_{t+1}
+=
+\operatorname{clip}
+\left(
+N_t + a_t,
+N_{\min},
+N_{\max}
+\right).
+\end{equation}
+
+This action space is close to practical autoscaling. It prevents a policy from jumping directly from minimum to maximum capacity in one step.
+
+\subsection{Continuous Absolute Actions}
+
+Original DDPG uses a continuous absolute action:
+
+\begin{equation}
+a_t \in [N_{\min},N_{\max}],
+\end{equation}
+
+\begin{equation}
+N_{t+1}
+=
+\operatorname{clip}
+\left(
+\operatorname{round}(a_t),
+N_{\min},
+N_{\max}
+\right).
+\end{equation}
+
+This design is reactive in the sense that the actor directly proposes the full desired replica count. It is also risky because the actor can learn boundary actions too easily. In the experiments, this produced policies that stayed near minimum or maximum capacity.
+
+\subsection{Continuous Delta Actions}
+
+Tuned DDPG, SAC, TD3, and PPO Delta use:
+
+\begin{equation}
+a_t \in [-\Delta_{\max},+\Delta_{\max}],
+\qquad \Delta_{\max}=2.
+\end{equation}
+
+The action is rounded and applied as a bounded change:
+
+\begin{equation}
+N_{t+1}
+=
+\operatorname{clip}
+\left(
+N_t + \operatorname{round}(a_t),
+N_{\min},
+N_{\max}
+\right).
+\label{eq:delta}
+\end{equation}
+
+This was the best action design in the project. It preserves continuous control while keeping behavior close to safe autoscaling practice.
+
+\section{Transition Model}
+
+The simulator transition follows this sequence:
+
+\begin{enumerate}
+  \item receive action $a_t$;
+  \item convert the action to a new replica count $N_{t+1}$;
+  \item advance the workload trace to $L_{t+1}$;
+  \item compute utilization and latency;
+  \item compute reward;
+  \item return the new observation.
+\end{enumerate}
+
+The environment uses a simplified capacity model:
+
+\begin{equation}
+\text{capacity}_{t}
+=
+150 \times N_t,
+\end{equation}
+
+\begin{equation}
+u_t =
+\frac{L_t}{150 N_t},
+\qquad
+C_t =
+\min(100,100u_t).
+\end{equation}
+
+Latency is modeled as:
+
+\begin{equation}
+\lambda_t =
+\min
+\left(
+1000,
+\frac{50}{\max(0.01,1-\min(u_t,0.99))}
+\right).
+\label{eq:latency}
+\end{equation}
+
+This formula captures the idea that latency grows quickly when utilization approaches saturation.
+
+\section{Reward Function}
+
+The reward before clipping is:
+
+\begin{equation}
+r_t
+=
+-
+\left(
+\alpha \max(0,\lambda_t - \lambda_{\text{target}})
++ \beta N_t
++ \gamma_{\text{stab}} |N_t - N_{t-1}|
+\right),
+\label{eq:reward}
+\end{equation}
+
+with:
+
+\begin{equation}
+\lambda_{\text{target}}=200 \text{ ms},
+\qquad
+\alpha=1.0,
+\qquad
+\beta=0.5,
+\qquad
+\gamma_{\text{stab}}=0.1 \text{ or } 0.3.
+\end{equation}
+
+The environment clips the reward:
+
+\begin{equation}
+\tilde{r}_t =
+\operatorname{clip}(r_t,-50,50).
+\end{equation}
+
+The reward is negative because it is written as a cost penalty. Higher reward still means better performance because a value closer to zero represents less total penalty.
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lY}
+\toprule
+\textbf{Term} & \textbf{Meaning} \\
+\midrule
+SLA violation & Penalizes latency above the 200 ms target. \\
+Cost & Penalizes running more pod replicas. \\
+Stability & Penalizes frequent replica changes. \\
+\bottomrule
+\end{tabularx}
+\caption{Reward interpretation}
+\end{table}
+
+\section{Discount Factor and Stability Weight}
+
+The report uses two different quantities named gamma:
+
+\begin{itemize}
+  \item $\gamma$ is the reinforcement-learning discount factor in the return equation;
+  \item $\gamma_{\text{stab}}$ is the stability coefficient inside the reward function.
+\end{itemize}
+
+Changing $\gamma_{\text{stab}}$ does not change the DQN Bellman update. It changes the objective being optimized by making replica changes more or less expensive. This distinction matters because the DQN low-stability experiment changed the reward function, not the temporal discounting rule.
+
+% ============================================================
+\chapter{Datasets and Preprocessing}
+\label{chap:data}
+
+\section{Overview}
+
+The benchmark uses five workload sources. All real datasets are transformed into 200-step traces so they can be evaluated under the same environment and reward function.
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lYl}
+\toprule
+\textbf{Dataset} & \textbf{Role in the project} & \textbf{Evaluation split} \\
+\midrule
+Synthetic & Controlled debugging workload with smooth periodic demand. & Generated episodes \\
+Azure Functions & Real serverless invocation demand. & Days 11 to 14 \\
+Alibaba machine & Machine-level production resource-utilization pressure. & Held-out machines \\
+Alibaba microservice & Service-level QPS, response time, and resource behavior. & Held-out services \\
+GWA-T / Bitbrains & VM-level resource-utilization traces from a different provider. & Held-out VM traces \\
+\bottomrule
+\end{tabularx}
+\caption{Datasets used in the benchmark}
+\end{table}
+
+\section{Synthetic Workload}
+
+The synthetic workload is generated by the environment:
+
+\begin{equation}
+L_t =
+500
++ 400 \sin
+\left(
+\frac{2\pi t}{T}
+\right)
++ \epsilon_t,
+\qquad
+\epsilon_t \sim \mathcal{N}(0,20^2).
+\end{equation}
+
+The synthetic trace is useful for debugging because its shape is smooth and predictable. It is not enough for final conclusions because real workloads contain bursts, plateaus, sudden drops, and irregular patterns.
+
+\section{Azure Functions Dataset}
+
+The Azure Functions Dataset 2019 contains invocation counts for serverless functions collected from Microsoft Azure \cite{azurefunctions}. In this project:
+
+\begin{enumerate}
+  \item each daily CSV is loaded;
+  \item invocation columns are summed across functions to obtain one aggregate per-minute load signal;
+  \item 1440 minutes are binned into 200 timesteps;
+  \item the result is min-max rescaled into the 100 to 900 operating range;
+  \item days 1 to 10 are used for training;
+  \item days 11 to 14 are held out for evaluation.
+\end{enumerate}
+
+This dataset is useful because it tests bursty real demand rather than a smooth simulator.
+
+\section{Alibaba Machine Usage Dataset}
+
+The Alibaba machine dataset comes from the Alibaba Cluster Trace Program, which publishes production cluster traces for cluster-management research \cite{alibabaClusterData,alibabaTrace2018}. The local file used in the project is \pathcode{data/alibaba/machine_usage.csv}. Each row contains a machine identifier, timestamp, CPU utilization, memory utilization, network measurements, and disk I/O.
+
+The project converts machine utilization into one autoscaling pressure signal:
+
+\begin{equation}
+P_t =
+0.65 C_t
++ 0.20 M_t
++ 0.10 \max(\text{net\_in}_t,\text{net\_out}_t)
++ 0.05 D_t.
+\label{eq:alibaba-machine}
+\end{equation}
+
+CPU receives the largest weight because HPA is usually CPU-oriented. Memory and network pressure are included because real overload is often multi-resource. Disk receives a smaller weight because disk readings can be noisy.
+
+Each selected machine becomes one 200-step trace. The train-test split is by machine ID, so evaluation measures generalization to machines not seen during training.
+
+\section{Alibaba Microservice Dataset}
+
+The Alibaba microservice dataset contains service-level request and resource traces, including QPS, response-time indicators, and instance resource usage. This dataset is closest to pod autoscaling because the unit of analysis is a service rather than only a physical or virtual machine.
+
+The project uses:
+
+\begin{itemize}
+  \item \pathcode{MSRTQps_0.csv} for request rate and response-time metrics;
+  \item \pathcode{MSResource_0.csv} for service instance CPU and memory usage.
+\end{itemize}
+
+For each selected microservice, QPS is used as the base workload signal. Response time and resource pressure modify that signal:
+
+\begin{equation}
+P_t =
+Q_t
+\left(
+1
++ 0.20 R_t
++ 0.20 U_t
+\right),
+\label{eq:alibaba-micro}
+\end{equation}
+
+where $Q_t$ is the scaled QPS signal, $R_t$ is response-time pressure, and $U_t$ is resource pressure derived from CPU and memory:
+
+\begin{equation}
+U_t =
+\operatorname{clip}
+\left(
+0.70 C_t + 0.30 M_t,
+0,
+1
+\right).
+\end{equation}
+
+The combined pressure signal is then rescaled to the same 100 to 900 range used by the simulator.
+
+\section{GWA-T / Bitbrains Dataset}
+
+The GWA-T/Bitbrains dataset contains performance traces for 1750 virtual machines, including CPU usage, memory usage, disk throughput, and network throughput \cite{bitbrains2015}. The local project reads VM CSV files from \pathcode{data/gwat}.
+
+The preprocessing function converts each VM trace into a pressure signal:
+
+\begin{equation}
+P_t =
+0.60 C_t
++ 0.25 M_t
++ 0.10 N_t^{\text{net}}
++ 0.05 D_t.
+\label{eq:gwat}
+\end{equation}
+
+CPU remains the dominant component. Memory is significant. Network and disk are included after robust scaling because their raw units are not directly comparable to CPU and memory percentages.
+
+\section{Why All Datasets Are Rescaled}
+
+The simulator expects a workload range compatible with the latency and capacity model. Therefore, all real traces are rescaled into the same approximate range. This makes the algorithm comparison controlled because the reward function, replica limits, and latency model remain the same across datasets.
+
+This choice has a limitation: the absolute units of the original datasets are abstracted away. The benchmark should therefore be interpreted as a policy-comparison study under normalized demand pressure, not as a direct measurement of production latency in a real cluster.
+
+% ============================================================
+\chapter{Algorithms}
+\label{chap:algorithms}
+
+\section{Random Baseline}
+
+The Random policy samples a valid action from the environment action space at each timestep:
+
+\begin{equation}
+a_t \sim \text{Uniform}(\mathcal{A}).
+\end{equation}
+
+It has no learning, no memory, and no control logic. It is used as a lower-bound sanity check. Any useful autoscaling method should outperform Random by a large margin.
+
+\section{HPA Baseline}
+
+HPA is the Kubernetes-style rule-based baseline. It computes the desired number of replicas with Equation~\ref{eq:hpa}. In the implementation, the desired replica count is clipped to the same minimum and maximum bounds used by the RL agents:
+
+\begin{equation}
+N_{\text{desired}}
+=
+\operatorname{clip}
+\left(
+\left\lceil
+N_t
+\frac{C_t}{C_{\text{target}}}
+\right\rceil,
+N_{\min},
+N_{\max}
+\right),
+\end{equation}
+
+with $C_{\text{target}}=50\%$.
+
+For evaluation in the discrete environment, the HPA desired count is converted to a bounded delta:
+
+\begin{equation}
+\Delta N_t =
+\operatorname{clip}
+\left(
+N_{\text{desired}} - N_t,
+-2,
+2
+\right).
+\end{equation}
+
+HPA is strong when CPU is an accurate signal and the workload changes gradually. It becomes weaker when the best decision depends on delayed consequences or on balancing several penalties that are not present in the HPA formula.
+
+\section{DQN}
+
+\subsection{Principle}
+
+DQN is a value-based reinforcement-learning algorithm for discrete actions \cite{mnih2015}. It approximates the action-value function:
+
+\begin{equation}
+Q_{\theta}(s,a)
+\approx
+\mathbb{E}
+\left[
+\sum_{k=0}^{\infty}
+\gamma^k r_{t+k+1}
+\mid
+s_t=s,\ a_t=a
+\right].
+\end{equation}
+
+The policy chooses:
+
+\begin{equation}
+\pi(s)
+=
+\arg\max_{a \in \mathcal{A}}
+Q_{\theta}(s,a).
+\end{equation}
+
+The Bellman target is:
+
+\begin{equation}
+y_t =
+r_t
++ \gamma
+\max_{a'}
+Q_{\theta^-}(s_{t+1},a'),
+\end{equation}
+
+where $\theta^-$ denotes the target network. The loss is:
+
+\begin{equation}
+\mathcal{L}_{\text{DQN}}(\theta)
+=
+\mathbb{E}_{(s,a,r,s') \sim \mathcal{D}}
+\left[
+\left(
+y_t - Q_{\theta}(s_t,a_t)
+\right)^2
+\right].
+\end{equation}
+
+DQN uses an experience replay buffer $\mathcal{D}$ to reduce correlation between consecutive transitions. It also uses a target network to reduce instability caused by moving targets.
+
+\subsection{Use in This Project}
+
+DQN uses the five discrete delta actions:
+
+\begin{equation}
+\{-2,-1,0,+1,+2\}.
+\end{equation}
+
+This makes it a natural baseline for pod autoscaling because real autoscalers commonly adjust capacity by bounded steps.
+
+\subsection{Why DQN Results Are Mixed}
+
+DQN performs well when the workload structure is simple enough for discrete choices to capture. It is strong on synthetic data and Alibaba microservice data. It struggles on Azure and GWA-T because those traces are more irregular. With a high stability penalty, DQN becomes too cautious. It avoids replica changes and accepts latency spikes. With a lower stability penalty, it reacts more aggressively but increases cost and churn.
+
+\section{DQN With Lower Stability Penalty}
+
+The low-stability DQN experiment changes only:
+
+\begin{equation}
+\gamma_{\text{stab}}: 0.3 \rightarrow 0.1.
+\end{equation}
+
+This changes the reward:
+
+\begin{equation}
+r_t^{(0.3)}
+=
+-
+\left(
+\alpha \text{SLA}_t
++ \beta N_t
++ 0.3 |N_t-N_{t-1}|
+\right),
+\end{equation}
+
+\begin{equation}
+r_t^{(0.1)}
+=
+-
+\left(
+\alpha \text{SLA}_t
++ \beta N_t
++ 0.1 |N_t-N_{t-1}|
+\right).
+\end{equation}
+
+The DQN discount factor remains $\gamma=0.99$. The change is in the reward objective, not in temporal discounting.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{DQN version on Azure} & \textbf{Reward} & \textbf{SLA viol.} & \textbf{Cost} & \textbf{Churn} \\
+\midrule
+$\gamma_{\text{stab}}=0.3$ & $-1406.8$ & $5178.6$ & $1050.5$ & $109.9$ \\
+$\gamma_{\text{stab}}=0.1$ & $-932.5$ & $1444.0$ & $1351.8$ & $325.6$ \\
+\bottomrule
+\end{tabular}
+\caption{Effect of lowering the DQN stability coefficient}
+\label{tab:dqn-gamma-stab}
+\end{table}
+
+Lowering $\gamma_{\text{stab}}$ made replica changes cheaper in the reward. The agent became more responsive. SLA violation decreased by a large margin, but cost and churn increased.
+
+\section{DDPG}
+
+\subsection{Principle}
+
+DDPG is an off-policy actor-critic algorithm for continuous action spaces \cite{lillicrap2016}. It has:
+
+\begin{itemize}
+  \item an actor $\mu_{\theta}(s)$ that outputs a deterministic action;
+  \item a critic $Q_{\phi}(s,a)$ that estimates the value of a state-action pair.
+\end{itemize}
+
+The critic target is:
+
+\begin{equation}
+y_t =
+r_t
++ \gamma
+Q_{\phi^-}
+\left(
+s_{t+1},
+\mu_{\theta^-}(s_{t+1})
+\right),
+\end{equation}
+
+where $\theta^-$ and $\phi^-$ are target-network parameters. The critic minimizes:
+
+\begin{equation}
+\mathcal{L}_{Q}(\phi)
+=
+\mathbb{E}_{\mathcal{D}}
+\left[
+\left(
+Q_{\phi}(s_t,a_t)-y_t
+\right)^2
+\right].
+\end{equation}
+
+The actor is updated by the deterministic policy gradient:
+
+\begin{equation}
+\nabla_{\theta} J
+\approx
+\mathbb{E}_{s \sim \mathcal{D}}
+\left[
+\nabla_a Q_{\phi}(s,a)
+\vert_{a=\mu_{\theta}(s)}
+\nabla_{\theta}\mu_{\theta}(s)
+\right].
+\end{equation}
+
+Exploration is added by injecting noise into the actor output during training:
+
+\begin{equation}
+a_t =
+\mu_{\theta}(s_t)
++ \epsilon_t.
+\end{equation}
+
+\subsection{Original DDPG in This Project}
+
+Original DDPG used the continuous absolute action space. The actor directly predicted a desired replica count. This produced boundary behavior:
+
+\begin{itemize}
+  \item on synthetic, Alibaba machine, and GWA-T data, it often stayed at minimum replicas;
+  \item on Azure and Alibaba microservice data, it moved toward maximum replicas.
+\end{itemize}
+
+These results are not balanced autoscaling. They are degenerate policies. For example, a cost of 400 over 200 steps means the policy ran 2 replicas for the whole episode. A cost of 2000 over 200 steps means the policy ran 10 replicas for almost the whole episode.
+
+\section{Tuned DDPG}
+
+Tuned DDPG keeps the DDPG algorithm but changes the learning setup.
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lY}
+\toprule
+\textbf{Change} & \textbf{Purpose} \\
+\midrule
+Absolute action changed to delta action & Prevents direct jumps to boundary replica counts. \\
+Observation normalization & Keeps load, latency, CPU, and replicas on compatible numerical scales. \\
+Reward normalization & Stabilizes critic targets. \\
+Learning rate changed from $10^{-3}$ to $3 \times 10^{-4}$ & Reduces overly large neural-network updates. \\
+Replay buffer increased to 100000 & Improves transition diversity. \\
+Learning starts after 5000 steps & Allows the replay buffer to contain useful examples before training. \\
+Batch size set to 128 & Smooths gradient estimates. \\
+Step-based training frequency & Updates the model more regularly. \\
+Exploration noise reduced to $\sigma=0.35$ & Keeps exploration active without causing excessive jumps. \\
+Network architecture set to $[128,128]$ & Gives the actor and critic enough capacity for real traces. \\
+\bottomrule
+\end{tabularx}
+\caption{Tuned DDPG changes}
+\label{tab:tuned-ddpg}
+\end{table}
+
+The improvement was large. On synthetic data, reward improved from $-7369.0$ to $-628.9$. On Alibaba machine data, it improved from $-7852.6$ to $-779.3$. This shows that the first DDPG failure was not proof that actor-critic methods are unsuitable for autoscaling. It was mainly an action-space and training-stability problem.
+
+\section{SAC}
+
+\subsection{Principle}
+
+SAC, or Soft Actor-Critic, is an off-policy actor-critic algorithm based on maximum-entropy reinforcement learning \cite{haarnoja2018}. Instead of maximizing only expected return, SAC maximizes expected return plus policy entropy:
+
+\begin{equation}
+J(\pi)
+=
+\mathbb{E}_{\pi}
+\left[
+\sum_{t=0}^{\infty}
+\gamma^t
+\left(
+r_t
++ \alpha_{\text{ent}}
+\mathcal{H}
+(\pi(\cdot \mid s_t))
+\right)
+\right].
+\end{equation}
+
+The entropy term encourages the policy to remain exploratory during training. The soft value target can be written as:
+
+\begin{equation}
+y_t =
+r_t
++ \gamma
+\left(
+\min_{i=1,2}
+Q_{\phi_i^-}(s_{t+1},a_{t+1})
+- \alpha_{\text{ent}}
+\log \pi_{\theta}(a_{t+1}\mid s_{t+1})
+\right),
+\end{equation}
+
+with:
+
+\begin{equation}
+a_{t+1} \sim \pi_{\theta}(\cdot \mid s_{t+1}).
+\end{equation}
+
+SAC uses two critics, a stochastic actor, replay buffer learning, and automatic entropy tuning in this project through \pathcode{ent_coef="auto"}.
+
+\subsection{Why SAC Performs Best}
+
+Autoscaling contains several valid strategies. One policy may protect SLA by using more replicas. Another may reduce cost by tolerating small latency spikes. SAC explores these strategies more effectively because entropy prevents the policy from becoming deterministic too early. In the benchmark, SAC gives the best reward on Azure, Alibaba machine, Alibaba microservice, and GWA-T.
+
+\section{TD3}
+
+\subsection{Principle}
+
+TD3, or Twin Delayed Deep Deterministic Policy Gradient, is an improvement over DDPG designed to reduce function-approximation error in actor-critic learning \cite{fujimoto2018}. It introduces three main mechanisms.
+
+First, TD3 uses two critics and takes the minimum target value:
+
+\begin{equation}
+y_t =
+r_t
++ \gamma
+\min_{i=1,2}
+Q_{\phi_i^-}
+\left(
+s_{t+1},
+\tilde{a}_{t+1}
+\right).
+\end{equation}
+
+Second, it adds target policy smoothing:
+
+\begin{equation}
+\tilde{a}_{t+1}
+=
+\mu_{\theta^-}(s_{t+1})
++ \operatorname{clip}(\epsilon,-c,c),
+\qquad
+\epsilon \sim \mathcal{N}(0,\sigma^2).
+\end{equation}
+
+Third, TD3 delays actor updates. The actor is updated less frequently than the critics, giving value estimates more time to stabilize.
+
+\subsection{Why TD3 Is Strong}
+
+TD3 keeps the continuous-control advantage of DDPG while reducing its tendency to chase overestimated critic values. In autoscaling, this matters because overestimating a bad replica count can push the actor toward a persistent under-provisioned or over-provisioned policy. TD3 is close to SAC across most datasets. It often achieves very low SLA violation, but it sometimes uses slightly more replicas or has slightly higher churn, which allows SAC to win by reward.
+
+\section{PPO Discrete and PPO Delta}
+
+\subsection{Principle}
+
+PPO, or Proximal Policy Optimization, is an on-policy policy-gradient algorithm \cite{schulman2017}. It improves training stability by limiting how far the new policy can move from the policy that collected the data.
+
+The probability ratio is:
+
+\begin{equation}
+\rho_t(\theta)
+=
+\frac{
+\pi_{\theta}(a_t \mid s_t)
+}{
+\pi_{\theta_{\text{old}}}(a_t \mid s_t)
+}.
+\end{equation}
+
+The clipped PPO objective is:
+
+\begin{equation}
+\mathcal{L}^{\text{CLIP}}(\theta)
+=
+\mathbb{E}_t
+\left[
+\min
+\left(
+\rho_t(\theta)\hat{A}_t,
+\operatorname{clip}
+(\rho_t(\theta),1-\epsilon,1+\epsilon)\hat{A}_t
+\right)
+\right],
+\end{equation}
+
+where $\hat{A}_t$ is the estimated advantage and $\epsilon$ is the clipping range. In this project, $\epsilon=0.2$.
+
+The advantage is estimated using Generalized Advantage Estimation:
+
+\begin{equation}
+\hat{A}_t =
+\sum_{l=0}^{\infty}
+(\gamma \lambda)^l
+\delta_{t+l},
+\end{equation}
+
+\begin{equation}
+\delta_t =
+r_t
++ \gamma V(s_{t+1})
+- V(s_t).
+\end{equation}
+
+\subsection{Two PPO Variants}
+
+Two variants are used:
+
+\begin{itemize}
+  \item PPO Discrete uses the same five discrete delta actions as DQN;
+  \item PPO Delta uses the continuous delta action environment.
+\end{itemize}
+
+PPO is stable because its clipped objective limits destructive policy updates. It does not collapse like original DDPG. However, PPO is on-policy, so it does not reuse old experience as efficiently as SAC or TD3. In the benchmark, PPO is competitive but often slightly more expensive because it protects SLA by keeping more replicas running.
+
+% ============================================================
+\chapter{Implementation}
+\label{chap:implementation}
+
+\section{Repository Structure}
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lY}
+\toprule
+\textbf{Path} & \textbf{Role} \\
+\midrule
+\pathcode{envs/autoscaling_env.py} & Gymnasium autoscaling simulator. \\
+\pathcode{envs/__init__.py} & Registers the environment IDs. \\
+\pathcode{envs/data_loader.py} & Loads and preprocesses Azure, Alibaba, Alibaba microservice, and GWA-T traces. \\
+\pathcode{baselines/hpa_policy.py} & Implements the HPA baseline formula. \\
+\pathcode{agents/train_*.py} & Trains RL agents on synthetic or real datasets. \\
+\pathcode{evaluation/evaluate*.py} & Evaluates trained policies and prints benchmark tables. \\
+\pathcode{models/} & Stores trained models and normalization statistics. \\
+\pathcode{logs/} & Stores TensorBoard logs. \\
+\bottomrule
+\end{tabularx}
+\caption{Main repository structure}
+\end{table}
+
+\section{Environment Registration}
+
+The project registers three environments:
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lY}
+\toprule
+\textbf{Environment ID} & \textbf{Meaning} \\
+\midrule
+\pathcode{Autoscaling-v0} & Discrete delta actions, used by DQN and PPO Discrete. \\
+\pathcode{AutoscalingContinuous-v0} & Continuous absolute actions, used by original DDPG. \\
+\pathcode{AutoscalingContinuousDelta-v0} & Continuous delta actions, used by Tuned DDPG, SAC, TD3, and PPO Delta. \\
+\bottomrule
+\end{tabularx}
+\caption{Registered Gymnasium environments}
+\end{table}
+
+\section{Environment Step Function}
+
+At each step, the environment:
+
+\begin{enumerate}
+  \item stores the previous replica count;
+  \item applies the action according to the action mode;
+  \item advances the workload;
+  \item computes latency and CPU;
+  \item computes the clipped reward;
+  \item returns the observation and diagnostic information.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={Reward calculation in the environment}]
+sla_violation = max(0, self.latency - 200)
+cost = self.replicas
+stability_penalty = abs(self.replicas - prev_replicas)
+
+reward = -(
+    self.alpha * sla_violation
+    + self.beta * cost
+    + self.gamma_stab * stability_penalty
+)
+reward = float(np.clip(reward, -50, 50))
+\end{lstlisting}
+
+The same reward is used for all algorithms and datasets. This is important because the benchmark compares policies, not different objective functions.
+
+\section{Training Scripts}
+
+The project contains two styles of training scripts.
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lY}
+\toprule
+\textbf{Script style} & \textbf{Examples} \\
+\midrule
+Algorithm-specific scripts & \pathcode{train_dqn.py}, \pathcode{train_ddpg.py}, \pathcode{train_sac.py}, \pathcode{train_td3.py}, \pathcode{train_ppo_discrete.py}. \\
+Dataset-wide scripts & \pathcode{train_alibaba.py}, \pathcode{train_alibaba_microservices.py}, \pathcode{train_gwat.py}. \\
+\bottomrule
+\end{tabularx}
+\caption{Training script organization}
+\end{table}
+
+The dataset-wide scripts train all supported algorithms on the chosen dataset through the command-line argument \pathcode{--algo}. They also support \pathcode{--prepare-only}, which builds the compact trace cache without training a model.
+
+\section{Evaluation Scripts}
+
+Evaluation uses 20 fixed-seed episodes. For each episode, the policy is run deterministically where applicable. The evaluation reports:
+
+\begin{itemize}
+  \item mean episode reward;
+  \item mean cumulative SLA violation;
+  \item mean cumulative cost;
+  \item mean cumulative churn.
+\end{itemize}
+
+For real datasets, the evaluation episodes sample from held-out traces. This prevents the benchmark from measuring only memorization of training traces.
+
+\section{Normalization}
+
+Normalization is used for Tuned DDPG, SAC, TD3, and PPO variants through Stable-Baselines3 \pathcode{VecNormalize}. It normalizes observations and rewards during training. At evaluation time, the saved normalization statistics are loaded, training mode is disabled, and reward normalization is disabled.
+
+This detail is important because the policy must receive observations in the same normalized scale it saw during training. Without this, a trained model can behave incorrectly even if the saved weights are valid.
+
+% ============================================================
+\chapter{Experimental Results}
+\label{chap:results}
+
+\section{Evaluation Metrics}
+
+Each policy is evaluated using four metrics:
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lY}
+\toprule
+\textbf{Metric} & \textbf{Interpretation} \\
+\midrule
+Reward & Combined clipped episode return. Higher is better because values are negative penalties. \\
+SLA violation & Sum of milliseconds above the 200 ms latency target. Lower is better. \\
+Cost & Sum of replica counts across the episode. Lower is cheaper. \\
+Churn & Sum of absolute replica-count changes. Lower is more stable. \\
+\bottomrule
+\end{tabularx}
+\caption{Evaluation metrics}
+\end{table}
+
+Reward is the main ranking metric, but the other metrics explain why a policy obtained that reward.
+
+\section{Synthetic Workload}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Policy} & \textbf{Reward} & \textbf{SLA viol.} & \textbf{Cost} & \textbf{Churn} \\
+\midrule
+Random & $-3842.6$ & $44591.4$ & $1173.1$ & $195.5$ \\
+DQN & $-744.6$ & $363.9$ & $1241.3$ & $24.8$ \\
+HPA & $-718.2$ & $189.3$ & $1323.8$ & $44.4$ \\
+DDPG & $-7369.0$ & $111228.7$ & $400.0$ & $0.0$ \\
+Tuned DDPG & \best{$-628.9$} & $205.0$ & $1113.0$ & $70.8$ \\
+\bottomrule
+\end{tabular}
+\caption{Synthetic workload benchmark}
+\label{tab:synthetic}
+\end{table}
+
+Tuned DDPG obtains the best reward. HPA has slightly lower SLA violation, but Tuned DDPG uses fewer replicas, so the combined penalty is lower. Original DDPG fails by staying at the minimum replica count. The cost of 400 and churn of 0 confirm this behavior.
+
+\section{Azure Functions Held-Out Data}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Policy} & \textbf{Reward} & \textbf{SLA viol.} & \textbf{Cost} & \textbf{Churn} \\
+\midrule
+Random & $-3548.8$ & $40265.0$ & $1173.1$ & $195.5$ \\
+DQN, $\gamma_{\text{stab}}=0.3$ & $-1406.8$ & $5178.6$ & $1050.5$ & $109.9$ \\
+HPA & $-840.2$ & $1092.7$ & $1287.0$ & $187.8$ \\
+DQN, $\gamma_{\text{stab}}=0.1$ & $-932.5$ & $1444.0$ & $1351.8$ & $325.6$ \\
+DDPG & $-1000.8$ & $0.0$ & $2000.0$ & $8.0$ \\
+Tuned DDPG & $-744.6$ & $717.7$ & $1265.2$ & $173.2$ \\
+SAC & \best{$-702.9$} & $452.6$ & $1250.6$ & $146.0$ \\
+TD3 & $-733.2$ & $598.8$ & $1259.5$ & $168.2$ \\
+PPO Discrete & $-739.9$ & $527.9$ & $1296.5$ & $215.2$ \\
+PPO Delta & $-740.2$ & $507.7$ & $1318.6$ & $192.2$ \\
+\bottomrule
+\end{tabular}
+\caption{Azure Functions held-out benchmark}
+\label{tab:azure}
+\end{table}
+
+SAC is the best policy on Azure. It beats HPA on reward, SLA violation, cost, and churn. TD3, PPO, and Tuned DDPG also beat HPA by reward. The original DQN with $\gamma_{\text{stab}}=0.3$ is too cautious and allows too much SLA violation. Lowering $\gamma_{\text{stab}}$ improves SLA behavior but increases cost and churn.
+
+Original DDPG has zero SLA violation but very high cost. This is not a good policy. It protects latency by running near maximum capacity, which removes the autoscaling trade-off.
+
+\section{Alibaba Machine Data}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Policy} & \textbf{Reward} & \textbf{SLA viol.} & \textbf{Cost} & \textbf{Churn} \\
+\midrule
+Random & $-3414.2$ & $37659.9$ & $1173.1$ & $195.5$ \\
+HPA & $-1329.8$ & $5965.5$ & $1258.7$ & $192.1$ \\
+DQN & $-1297.4$ & $5484.2$ & $1209.7$ & $234.8$ \\
+DDPG & $-7852.6$ & $115233.8$ & $400.0$ & $0.0$ \\
+Tuned DDPG & $-779.3$ & $442.9$ & $1388.4$ & $143.8$ \\
+SAC & \best{$-770.5$} & $144.5$ & $1467.2$ & $114.3$ \\
+TD3 & $-774.3$ & $150.3$ & $1439.1$ & $136.2$ \\
+PPO Discrete & $-812.2$ & $211.6$ & $1500.8$ & $178.8$ \\
+PPO Delta & $-812.1$ & $147.3$ & $1554.3$ & $145.4$ \\
+\bottomrule
+\end{tabular}
+\caption{Alibaba machine benchmark}
+\label{tab:alibaba-machine}
+\end{table}
+
+SAC, TD3, and Tuned DDPG are very close on Alibaba machine data. SAC wins by reward and has the lowest SLA violation. The result is important because this dataset is resource-utilization based, not only request-count based. The best algorithms are continuous delta actor-critic methods, which suggests that resource pressure is better handled by smooth bounded adjustments than by direct absolute replica prediction.
+
+\section{Alibaba Microservice Data}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Policy} & \textbf{Reward} & \textbf{SLA viol.} & \textbf{Cost} & \textbf{Churn} \\
+\midrule
+Random & $-3491.4$ & $38453.8$ & $1173.1$ & $195.5$ \\
+HPA & $-747.0$ & $639.5$ & $1274.9$ & $106.9$ \\
+DQN & $-695.9$ & $502.2$ & $1231.3$ & $192.7$ \\
+DDPG & $-1000.8$ & $0.0$ & $2000.0$ & $8.0$ \\
+Tuned DDPG & $-650.2$ & $429.8$ & $1131.3$ & $128.2$ \\
+SAC & \best{$-622.0$} & $333.2$ & $1154.0$ & $90.8$ \\
+TD3 & $-651.6$ & $384.5$ & $1140.3$ & $138.2$ \\
+PPO Discrete & $-662.9$ & $527.6$ & $1150.8$ & $101.8$ \\
+PPO Delta & $-794.9$ & $626.9$ & $1372.0$ & $167.5$ \\
+\bottomrule
+\end{tabular}
+\caption{Alibaba microservice benchmark}
+\label{tab:alibaba-micro}
+\end{table}
+
+Alibaba microservice data is especially relevant for pod autoscaling because it is service-level data. SAC again gives the best reward. It also improves all individual metrics compared with HPA. DQN is strong on this dataset and beats HPA by reward, which suggests that the discrete delta action space can work well when the service-level signal is informative enough.
+
+PPO Delta performs worse here than PPO Discrete. This indicates that a continuous action space is not automatically better. The training algorithm and the action representation must fit the dataset.
+
+\section{GWA-T / Bitbrains Data}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Policy} & \textbf{Reward} & \textbf{SLA viol.} & \textbf{Cost} & \textbf{Churn} \\
+\midrule
+Random & $-3361.9$ & $38469.7$ & $1173.1$ & $195.5$ \\
+HPA & $-1674.5$ & $12554.1$ & $1173.4$ & $180.2$ \\
+DQN & $-1681.6$ & $12947.9$ & $1182.1$ & $159.8$ \\
+DDPG & $-6769.1$ & $100557.2$ & $400.0$ & $0.0$ \\
+Tuned DDPG & $-907.3$ & $550.4$ & $1621.2$ & $102.7$ \\
+SAC & \best{$-893.9$} & $810.0$ & $1525.5$ & $73.3$ \\
+TD3 & $-897.3$ & $640.3$ & $1630.0$ & $96.3$ \\
+PPO Discrete & $-937.0$ & $526.8$ & $1753.5$ & $120.5$ \\
+PPO Delta & $-937.4$ & $584.2$ & $1736.0$ & $108.3$ \\
+\bottomrule
+\end{tabular}
+\caption{GWA-T / Bitbrains benchmark}
+\label{tab:gwat}
+\end{table}
+
+GWA-T is the hardest dataset for HPA and DQN. Both have high SLA violation. SAC wins by reward because it has the best overall trade-off. PPO Discrete has lower SLA violation than SAC, but it uses many more replicas. The higher cost reduces its total reward.
+
+\section{Dataset-by-Algorithm Reward Matrix}
+
+\begin{table}[H]
+\centering
+\scriptsize
+\begin{tabular}{lrrrrrrrrrr}
+\toprule
+\textbf{Dataset} & \textbf{Random} & \textbf{HPA} & \textbf{DQN} & \textbf{DQN low stab.} & \textbf{DDPG} & \textbf{Tuned DDPG} & \textbf{SAC} & \textbf{TD3} & \textbf{PPO Disc.} & \textbf{PPO Delta} \\
+\midrule
+Synthetic & $-3842.6$ & $-718.2$ & $-744.6$ & N/A & $-7369.0$ & \best{$-628.9$} & N/A & N/A & N/A & N/A \\
+Azure & $-3548.8$ & $-840.2$ & $-1406.8$ & $-932.5$ & $-1000.8$ & $-744.6$ & \best{$-702.9$} & $-733.2$ & $-739.9$ & $-740.2$ \\
+Alibaba machine & $-3414.2$ & $-1329.8$ & $-1297.4$ & N/A & $-7852.6$ & $-779.3$ & \best{$-770.5$} & $-774.3$ & $-812.2$ & $-812.1$ \\
+Alibaba microservice & $-3491.4$ & $-747.0$ & $-695.9$ & N/A & $-1000.8$ & $-650.2$ & \best{$-622.0$} & $-651.6$ & $-662.9$ & $-794.9$ \\
+GWA-T / Bitbrains & $-3361.9$ & $-1674.5$ & $-1681.6$ & N/A & $-6769.1$ & $-907.3$ & \best{$-893.9$} & $-897.3$ & $-937.0$ & $-937.4$ \\
+\bottomrule
+\end{tabular}
+\caption{Reward matrix with datasets as rows and algorithms as columns}
+\label{tab:reward-matrix}
+\end{table}
+
+\section{Best Policy per Dataset}
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lY}
+\toprule
+\textbf{Dataset} & \textbf{Best interpretation} \\
+\midrule
+Synthetic & Tuned DDPG wins because the smooth workload rewards controlled low-cost scaling. \\
+Azure & SAC wins and improves reward, SLA violation, cost, and churn compared with HPA. \\
+Alibaba machine & SAC wins, with TD3 and Tuned DDPG very close. \\
+Alibaba microservice & SAC wins on the most service-oriented dataset. \\
+GWA-T / Bitbrains & SAC wins by reward, while PPO Discrete has the lowest SLA violation but higher cost. \\
+\bottomrule
+\end{tabularx}
+\caption{Summary of winning policies}
+\label{tab:winners}
+\end{table}
+
+% ============================================================
+\chapter{Discussion}
+\label{chap:discussion}
+
+\section{Why SAC, TD3, PPO, and Tuned DDPG Beat the Others}
+
+The strongest methods share two properties. First, they use bounded delta actions. Second, they use training mechanisms that reduce instability.
+
+SAC wins most often because entropy regularization improves exploration and prevents early deterministic collapse. It can test different levels of aggressiveness during training, then converge toward a policy that balances SLA, cost, and churn.
+
+TD3 is strong because it fixes core DDPG weaknesses. The twin-critic minimum reduces overestimation. Target policy smoothing avoids overfitting to narrow action values. Delayed actor updates prevent the policy from changing before the critic is stable enough.
+
+Tuned DDPG is strong because the tuning fixed the main source of failure. The algorithm did not change, but the environment interface did. Switching from absolute actions to delta actions removed the easiest path to boundary policies. Normalization made the critic easier to train.
+
+PPO is strong because clipped updates make learning conservative. It is less likely to collapse. Its limitation is cost: PPO often protects SLA by running more replicas than SAC or TD3.
+
+\section{Why Original DDPG Fails}
+
+Original DDPG fails because deterministic continuous control is sensitive to critic errors. If the critic temporarily overestimates a boundary action, the actor can learn to repeat that boundary action. In this project, the absolute action space made that behavior easy:
+
+\begin{itemize}
+  \item minimum boundary: low cost, zero churn, very high SLA violation;
+  \item maximum boundary: zero SLA violation, very high cost, very low churn.
+\end{itemize}
+
+Neither behavior is meaningful autoscaling. A good autoscaler should move between these extremes according to workload pressure.
+
+\section{Why HPA Does Not Always Win}
+
+HPA is a strong baseline, but it optimizes one immediate CPU-based rule. It does not optimize the project reward. It also does not learn dataset-specific patterns. On synthetic data, HPA is close to DQN because the signal is smooth and CPU-aligned. On GWA-T, HPA has high SLA violation because the pressure signal includes more irregular resource behavior. Learned actor-critic methods adapt better to those patterns.
+
+\section{Why DQN Is Useful but Sensitive}
+
+DQN is useful because pod autoscaling can be expressed naturally as discrete delta decisions. It is also easier to interpret than continuous actor-critic methods. However, DQN depends strongly on the reward weights. The Azure low-stability experiment shows this clearly. Reducing the churn penalty makes DQN more aggressive, which improves SLA but increases churn and cost.
+
+\section{Single-Run Caveat}
+
+All reported final values come from one trained model per configuration, evaluated over 20 episodes. The 20 episodes reduce evaluation noise, but they do not measure training-seed variance. This is a real limitation.
+
+An exploratory sweep of \pathcode{gamma_stab} showed non-monotonic behavior across seeds. This means a lower or higher stability coefficient does not guarantee the same ranking for every random initialization. The observation supports a specific methodological conclusion: future work should repeat each algorithm across multiple independent training seeds and report mean, standard deviation, and confidence intervals.
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lY}
+\toprule
+\textbf{Issue} & \textbf{Consequence} \\
+\midrule
+Single trained model per configuration & Rankings may depend partly on the training seed. \\
+Twenty evaluation episodes only & Evaluation is more stable than a single episode but does not replace multi-seed training. \\
+Exploratory \pathcode{gamma_stab} sweep was non-monotonic & Reward tuning should be evaluated statistically before making strong claims. \\
+\bottomrule
+\end{tabularx}
+\caption{Statistical limitations}
+\label{tab:limitations}
+\end{table}
+
+\section{Research Interpretation}
+
+The main research interpretation is that the action representation is as important as the algorithm name. Original DDPG and Tuned DDPG belong to the same algorithm family, but their results are completely different. This is because autoscaling is not only a continuous-control problem. It is a safety-sensitive control problem with bounded, operationally meaningful actions.
+
+The final benchmark also shows that HPA should not be treated as a weak baseline. HPA is competitive on smooth and CPU-aligned workloads. A reinforcement-learning method is valuable only if it can beat HPA on held-out real traces while keeping cost and churn reasonable. SAC provides the strongest evidence for that claim in this project.
+
+% ============================================================
+\chapter{Limitations and Future Work}
+\label{chap:future}
+
+\section{Limitations}
+
+The project has several limitations:
+
+\begin{itemize}
+  \item the environment uses a simplified latency model rather than measurements from a live Kubernetes cluster;
+  \item all real datasets are rescaled into a common load range, which removes original units;
+  \item each final model is trained once, so training-seed variance is not fully measured;
+  \item the benchmark does not include VPA, KEDA, ARIMA, LSTM, or GRU baselines;
+  \item pod startup delay, readiness probes, image-pull delay, and node scheduling constraints are not modeled;
+  \item the project evaluates a single-service autoscaling problem rather than a dependency graph of microservices.
+\end{itemize}
+
+\section{Future Work}
+
+The next steps are:
+
+\begin{itemize}
+  \item repeat all algorithms across multiple random seeds;
+  \item add confidence intervals to all benchmark tables;
+  \item test more values of \pathcode{gamma_stab}, especially 0.15 and 0.2;
+  \item add predictive baselines such as ARIMA, LSTM, or GRU;
+  \item compare with KEDA and VPA;
+  \item model Kubernetes startup delays and scale-down stabilization windows;
+  \item deploy the learned policy in a real Kubernetes test cluster;
+  \item test transfer learning across datasets, such as training on Alibaba and evaluating on GWA-T;
+  \item extend the environment to multi-service dependency graphs.
+\end{itemize}
+
+\section{Toward a Real Kubernetes Controller}
+
+A practical deployment should not allow a neural network to make unrestricted scaling changes. A safer design is a recommendation layer:
+
+\begin{enumerate}
+  \item collect metrics from Prometheus or the Kubernetes metrics API;
+  \item normalize observations using training statistics;
+  \item ask the trained policy for a bounded delta action;
+  \item apply safety rules such as minimum replicas, maximum replicas, cooldown, and stabilization windows;
+  \item send the final replica count to the Kubernetes API.
+\end{enumerate}
+
+This design combines the learning ability of reinforcement learning with the safety constraints expected in Kubernetes operations.
+
+% ============================================================
+\chapter{Conclusion}
+\label{chap:conclusion}
+
+This internship project formalized Kubernetes pod autoscaling as a Markov Decision Process and implemented a complete reinforcement-learning benchmark around it. The system includes a Gymnasium environment, multiple action-space variants, dataset preprocessing pipelines, training scripts, evaluation scripts, and benchmark tables across five workload sources.
+
+The results show that reinforcement learning can outperform HPA, but not automatically. DQN is a useful discrete baseline, but it is sensitive to the stability penalty and workload burstiness. Original DDPG fails because direct absolute replica actions encourage boundary policies. Tuned DDPG improves strongly after switching to bounded delta actions and normalized training. SAC is the strongest overall method because it combines replay-buffer efficiency, entropy-driven exploration, and stable actor-critic learning. TD3 is very close because it fixes DDPG overestimation and actor-update instability. PPO is stable and competitive, but often pays more cost to protect SLA.
+
+The most important conclusion is therefore not only that SAC obtained the best benchmark reward. The deeper conclusion is that successful RL autoscaling depends on matching the learning formulation to the operational nature of Kubernetes autoscaling. In this project, bounded delta actions, normalized training, and an explicit SLA-cost-stability reward were the key ingredients.
+
+\clearpage
+\printbibliography
+
+\end{document}

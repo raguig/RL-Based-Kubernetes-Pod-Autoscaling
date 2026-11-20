@@ -1,0 +1,496 @@
+\documentclass{rapportINPTCLOUD}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage{listings}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{csquotes}
+\usepackage{biblatex}
+\addbibresource{bibtex.bib}
+\usepackage{appendix}
+\usepackage{hyperref}
+
+\definecolor{codebg}{HTML}{F4F4F4}
+
+\lstset{
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  framerule=0.3pt,
+  framesep=6pt,
+  showstringspaces=false,
+}
+
+\title{Rapport de Stage}
+
+\begin{document}
+
+\titre{Reinforcement-Learning-Based Pod Autoscaling in Kubernetes}
+\sujet{An MDP Formulation with Deep Q-Networks and DDPG}
+\Encadrants{Prof. Driss \textsc{Allaki}}
+\eleves{Mohammed Amine \textsc{Raguig}}
+
+\fairemarges
+\fairepagedegarde
+\tabledematieres
+
+% ============================================================
+\chapter*{Acknowledgements}
+\addcontentsline{toc}{chapter}{Acknowledgements}
+
+I would like to thank Professor Driss Allaki for supervising this internship and for the guidance he gave me at several points where I was genuinely unsure which direction to take, in particular around the reward design and the DDPG instability I ran into partway through. Thanks also go to the SEEDS research team at INPT for the working environment and for the discussions that pushed me to test some of my assumptions more carefully than I initially planned to.
+
+Finally, I want to acknowledge that a good part of this internship consisted of debugging my own code at odd hours and re-reading the same DQN paper more times than I'd like to admit. It taught me more about reinforcement learning than any of the ten papers I read going in.
+
+\clearpage
+
+% ============================================================
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+
+Kubernetes' native autoscaler, the Horizontal Pod Autoscaler (HPA), scales a deployment by comparing a live metric against a fixed target. It works, but it is fundamentally reactive: it cannot act until after a load change has already happened, and it has no way to weigh service quality against resource cost explicitly. This internship investigates whether a reinforcement learning agent, trained directly on observable cluster metrics, can learn a scaling policy that matches or beats HPA on that trade-off.
+
+The problem was first formalized as a Markov Decision Process, with two competing formulations of the action space explored (delta versus absolute replica targets) before settling on a reward function combining SLA compliance, resource cost, and scaling stability. A Gymnasium-compatible simulation environment was then built and validated on a synthetic load signal before being extended to real traffic drawn from the Azure Functions Dataset 2019. Both a value-based agent (DQN) and an actor-critic agent (DDPG) were implemented and evaluated, along with three additional algorithms (SAC, TD3, PPO) added later once it became clear the DDPG/HPA gap on real data deserved a closer look than the proposal originally called for.
+
+The vanilla DQN agent comfortably outperforms a random policy but underperforms HPA on real traffic — a gap that a controlled experiment on the reward's stability weight partially explains and partially closes. A first DDPG run collapsed into a degenerate, constant policy; fixing it required observation/reward normalization and a round of hyperparameter tuning, after which the corrected agent, along with SAC, TD3, and both PPO variants, ends up beating HPA on real held-out data. That last result is probably the most interesting finding of the internship: the initial RL-versus-HPA gap turned out to be an implementation problem, not a limitation of RL itself.
+
+\clearpage
+
+% ============================================================
+\chapter{Introduction}
+
+\section{General context}
+
+Cloud-native applications are, at this point, mostly built as collections of small, independently deployed microservices rather than a single large program. Kubernetes has become the standard tool for running these microservices in containers at scale, and one of its main selling points is elasticity: the ability to grow or shrink the resources given to an application as demand changes, without a human watching a dashboard and manually adjusting things.
+
+Kubernetes ships with three autoscaling mechanisms that work at different levels: the Horizontal Pod Autoscaler (HPA) changes how many copies of a pod are running, the Vertical Pod Autoscaler (VPA) changes how much CPU and memory each pod gets, and the Cluster Autoscaler adds or removes physical nodes. This internship is concerned with the first of these. HPA's logic is a single formula:
+
+\begin{equation}
+\text{desiredReplicas} = \left\lceil \text{currentReplicas} \times \frac{\text{currentMetricValue}}{\text{desiredMetricValue}} \right\rceil
+\end{equation}
+
+Every check interval, it compares a metric (usually CPU utilization) against a configured target and scales the replica count accordingly, within a \texttt{minReplicas}/\texttt{maxReplicas} range set by whoever deployed the application.
+
+\section{Problem statement}
+
+HPA is simple, and that simplicity is also its main weakness. A few issues come up repeatedly in the literature (Chapter~\ref{chap:sota} covers this in more depth), and they're worth stating plainly here since they motivate everything that follows:
+
+HPA can only react to load that has already arrived. There is no mechanism for it to anticipate a spike it hasn't seen yet, and given that a new pod needs to be scheduled, pull its image, and pass readiness checks before it's actually useful, that reaction lag is not free — it costs real time during which the service is under-provisioned.
+
+The target threshold itself is a number someone picked, usually by trial and error, and that number is specific to one application under one kind of traffic pattern. Change the workload and the threshold that used to work stops working.
+
+HPA optimizes one metric at a time. It has no built-in way to say "I'd rather run slightly more pods than risk a latency spike" or the reverse — that trade-off, if it exists at all, is baked into the threshold choice rather than something the controller reasons about.
+
+And it does not learn. Whatever HPA does on day one, it does identically on day 200, regardless of how much traffic history has accumulated in the meantime.
+
+The question this internship set out to answer is whether an agent trained through trial and error — observing load, latency, CPU usage, and the current replica count, and learning from the consequences of its own scaling decisions — can do better than that fixed reactive rule, specifically on the trade-off between service quality and resource cost.
+
+\section{Objectives}
+
+The internship proposal set out two kinds of deliverables. On the research side: formalize autoscaling as an MDP with a state covering load, latency, CPU usage and replica count; design and justify a reward function that actually encodes the SLA/cost trade-off rather than optimizing a single number; implement a discrete-action agent (DQN) and a continuous-action agent (DDPG); and compare both against HPA on SLA compliance, cost, and stability. On the engineering side: a Gym-style simulation environment driven by real workload data, training code for both algorithms with proper logging, an evaluation module that replays held-out data, and some way of visualizing what the learned policies are actually doing.
+
+In practice the scope grew somewhat over the two months — partly because the first DQN-versus-HPA comparison on real data came out worse than expected, which is what led to the additional SAC/TD3/PPO runs described in Chapter~\ref{chap:results}. I've tried to be upfront in that chapter about which parts were in the original plan and which were added along the way.
+
+\section{Report organization}
+
+Chapter~\ref{chap:sota} reviews prior work on Kubernetes autoscaling, from purely reactive controllers through to recent RL-based approaches. Chapter~\ref{chap:pm} covers how the two months were actually spent versus how they were planned. Chapter~\ref{chap:design} is the design chapter — the MDP formalization, the theory behind DQN and DDPG, and the reasoning behind every non-obvious choice in the reward function and action space. Chapter~\ref{chap:impl} walks through the implementation itself, including a couple of things that went wrong along the way. Chapter~\ref{chap:results} presents the results, and Chapter~\ref{chap:conclusion} closes with a summary and what I'd do next given more time.
+
+% ============================================================
+\chapter{State of the Art}
+\label{chap:sota}
+
+\section{Reactive autoscaling}
+
+HPA, VPA, and KEDA (a CNCF extension that adds event-driven triggers, like queue depth, on top of the same underlying model) all share the same basic shape: compare a live metric to a threshold, act on the difference. This is easy to reason about and easy to deploy, which is presumably why it's the default, but it inherits all the limitations described in the introduction.
+
+\section{Predictive autoscaling}
+
+A step up from pure reaction is forecasting: use a time-series model — ARIMA, LSTM, GRU, Bi-LSTM all show up in the literature — to predict near-future load, then scale ahead of it using some fixed rule applied to the prediction. This helps with the lag problem, but these systems are still open-loop in an important sense: they predict what's coming, but they don't learn from whether their own past scaling decisions actually worked out.
+
+\section{RL-based autoscaling}
+\label{sec:sota-rl}
+
+Four papers I read shaped this internship's design more than the rest of the reading list, and it's worth going through them individually rather than as a single blob of related work.
+
+\textbf{NimbusGuard} (Wanigasooriya \& Ekanayake) \cite{nimbusguard} pairs a DQN agent with an LSTM forecaster and a validation layer built on an LLM orchestrated through LangGraph. What I actually borrowed from it, though, was smaller and more concrete: their state vector is only 4 dimensions (predicted memory utilization, current CPU, current memory, replica count), which is a useful data point that a compact state can be enough. Their reward also layers discrete action-specific bonuses and penalties — +0.2 for an appropriate scale-up, $-0.5$ for detected thrashing — on top of Gaussian utilization terms. Their reported result, that the DQN agent ends up more aggressive and less stable than HPA/KEDA while still winning on QoS, turned out to be almost exactly what I found in my own real-data comparison (Section~\ref{sec:gamma-stab}), which was reassuring in a "at least I'm not the only one seeing this" kind of way.
+
+\textbf{Pandey's multidimensional autoscaler} \cite{pandey} combines PPO and DDPG to handle horizontal and vertical scaling together, with a reward that explicitly weights SLA adherence against cost efficiency. What stands out methodologically is the rigor: 20 independent runs, mean $\pm$ standard deviation reported, paired t-tests against each baseline ($p<0.01$). Against HPA/VPA/KEDA they report roughly 30\% higher CPU utilization, 15--20\% lower p90 latency, and about 20\% cost savings. I did not replicate that level of statistical rigor here — every configuration in this report is a single trained agent evaluated over 20 episodes, not 20 independently trained agents — and I flag that explicitly as a limitation in Section~\ref{sec:discussion}.
+
+\textbf{Shukla's Gym-HPA} \cite{shukla} takes a different approach to the reward question entirely: instead of one combined objective, it trains three separate PPO agents, each optimizing a single target (CPU, memory, or cost) in isolation. I ended up going the opposite direction — one agent, one combined reward — mostly because it seemed more useful to be able to study the SLA/cost/stability trade-off by adjusting weights on a single policy, rather than comparing three agents that were never trained to agree with each other.
+
+\textbf{KARMA} (Soulé et al.) \cite{karma} is the most ambitious of the four. It decomposes "operational resilience" into failure-specific sub-goals — bottlenecks, DDoS attacks, pod crashes, resource contention — each handled by a specialized agent, coordinated through a formal organizational framework (MOISE+) and trained with multi-agent PPO. This is well beyond what a two-month internship with a single agent and a single reward could realistically attempt, but it's a natural direction for future work, and I come back to it in Section~\ref{sec:future}.
+
+\section{Where this project sits}
+
+This work follows NimbusGuard and Pandey most closely in spirit: one agent, one combined reward, compared directly against HPA. Where it differs is in three smaller ways — an explicit comparison between delta and absolute action framings for the continuous case (Section~\ref{sec:action-space}), a two-stage validation approach (synthetic environment first, then real Azure data) that turned out to be genuinely useful for isolating bugs from generalization problems, and a wider algorithm comparison (five algorithms in total) than the proposal originally called for.
+
+% ============================================================
+\chapter{Project Management}
+\label{chap:pm}
+
+\section{Planned timeline}
+
+The internship proposal laid out a weekly cadence of deliverables, summarized in Table~\ref{tab:timeline}.
+
+\begin{table}[h]
+\centering
+\begin{tabularx}{\textwidth}{lXl}
+\toprule
+\textbf{Due} & \textbf{Deliverable} & \textbf{Type} \\
+\midrule
+Week 1 & Literature review (10 key papers) & Document \\
+Week 1 & Git repo initialized + SOTA doc v0.1 & Code / Doc \\
+Week 2 & MDP Specification v1.0 & Document \\
+Week 2 & Dataset exploration notebook & Code \\
+Week 3 & Gymnasium environment (tag v0.1-env) & Code \\
+Week 3 & Random-vs-HPA demo + pytest tests & Code / Demo \\
+Week 4 & DQN v0.1 + learning curves & Code / Results \\
+Week 5 & Predictive baseline (ARIMA/LSTM) & Code \\
+Week 5 & Stable DQN v1.0 + DQN results report & Code / Report \\
+Week 6 & DDPG v0.1 & Code \\
+Week 6 & \texttt{evaluate.py} module & Code \\
+Week 7 & Final comparison table (DQN vs DDPG vs HPA vs predictive) & Results \\
+Week 7 & Visualization dashboards & Results \\
+Week 8 & Final report, slides, live demo, documented repo & Report / Presentation \\
+\bottomrule
+\end{tabularx}
+\caption{Original deliverable timeline}
+\label{tab:timeline}
+\end{table}
+
+\section{What actually happened}
+
+Roughly the first half of this went to plan, with a couple of exceptions. The MDP specification and the Gymnasium environment landed close to schedule. DQN training worked and produced a genuinely useful first result. Where things slipped was on two fronts: the predictive baseline (ARIMA/LSTM) never got built — by the time DQN's real-data results came in worse than expected, chasing that gap felt like a better use of remaining time than adding a third baseline — and the literature review and SOTA documentation, while eventually completed, landed later than planned, partly because the MDP/environment work kept surfacing questions that sent me back to the papers.
+
+The second half of the timeline changed more substantially than planned. DDPG's first training run collapsed into a degenerate policy (Section~\ref{sec:ddpg-collapse}), which took real time to diagnose and fix. Once fixed, the natural next question — is this DDPG-specific or would other algorithms show the same gap against HPA on real data? — led to adding SAC, TD3, and two PPO variants, none of which were in the original scope. I'd class that as scope creep in the technical sense, but it produced the single most interesting result in the whole project (Section~\ref{sec:benchmark}), so I don't regret the time it took.
+
+\section{Tools and setup}
+
+The whole pipeline is Python, built around Gymnasium for the environment interface and Stable-Baselines3 for the actual algorithm implementations (DQN, DDPG, SAC, TD3, PPO), with PyTorch underneath as the tensor/autodiff backend. Pandas and NumPy handle data loading and the trace-to-load-signal conversion; Matplotlib produces the comparison figures; TensorBoard is used for watching training curves live. Everything ran locally on a CPU-only machine — no GPU was used or particularly needed, since the state vectors involved are small (on the order of 8 numbers) rather than raw pixels.
+
+% ============================================================
+\chapter{Design}
+\label{chap:design}
+
+This chapter covers two things that belong together even though they sound separate: the theoretical grounding (what DQN and DDPG actually are, and why the naive combination of deep learning with Q-learning needs extra machinery to be stable) and the concrete formalization of this specific problem as an MDP. The second only makes sense once the first is in place.
+
+\section{Reinforcement learning background}
+
+In reinforcement learning, an agent interacts with an environment over a sequence of timesteps. At each step it observes a state, picks an action, and receives a reward along with the next state. The objective is not to maximize the immediate reward but the sum of rewards collected over the whole episode — sometimes a locally bad-looking action is necessary because it sets up a much better outcome a few steps later.
+
+\subsection{The Q-function}
+
+The central object in value-based RL is the action-value function:
+\begin{equation}
+Q(s,a) = \mathbb{E}\left[\sum_{k=0}^{\infty} \gamma^k r_{t+k} \;\middle|\; s_t=s,\ a_t=a\right]
+\end{equation}
+$Q(s,a)$ is a single number answering "if I take action $a$ in state $s$ right now, and act well afterward, how much total discounted reward do I get?" A good policy just picks whichever action has the highest $Q$-value at every state.
+
+Classic Q-learning stores these values in a table — one row per state, one column per action. That's fine for small, discrete problems, but breaks down completely once the state space is too large to enumerate, which is exactly the situation here (even a modest 8-dimensional continuous state has effectively infinite possible values). The fix, and the actual idea behind DQN, is to replace the table with a neural network: feed in a state, get back one $Q$-value per possible action.
+
+\subsection{Why this is unstable, and what fixes it}
+
+Training a neural network to predict $Q$-values directly is known to be unstable, for reasons that are worth spelling out because they justify two specific pieces of machinery used throughout this project. First, consecutive states in an episode are highly correlated — training on them in order causes the network to overfit to whatever just happened and forget everything before it. Second, the training target itself,
+\begin{equation}
+y = r + \gamma \max_{a'} Q(s', a'; \theta)
+\end{equation}
+is computed using the same network being updated, so every gradient step also moves the thing it's being compared against — a moving-target problem that can cause the training process to oscillate or diverge outright.
+
+The DQN paper's two fixes, both used here, are experience replay (store transitions in a buffer, train on randomly sampled batches rather than the live stream, which breaks the correlation problem) and a target network (a delayed, periodically-refreshed copy of the network used only to compute $y$, so the target holds still long enough for training to actually converge toward it). DDPG borrows both ideas, with the target update done as a continuous soft update, $\theta' \leftarrow \tau\theta + (1-\tau)\theta'$ with $\tau=0.005$, rather than DQN's periodic hard copy.
+
+\subsection{From DQN to DDPG}
+
+DQN picks the best action by computing $Q$ for every possible action and taking the max — which only works when there's a short, enumerable list of actions. The moment the action becomes a continuous number (a desired replica count, say, rather than a choice from \{$-2,-1,0,+1,+2$\}), that enumeration is no longer possible. DDPG's answer is to add a second network \cite{lillicrap2016}, an actor $\mu(s;\theta^\mu)$, trained to directly output the action that maximizes the critic's estimate of $Q$, rather than searching for it:
+\begin{equation}
+\nabla_{\theta^\mu} J \approx \mathbb{E}\left[\nabla_a Q(s,a;\theta^Q)\big|_{a=\mu(s)} \cdot \nabla_{\theta^\mu}\mu(s;\theta^\mu)\right]
+\end{equation}
+This is just the chain rule applied across the two networks: if nudging the actor's weights shifts the action in a direction the critic rates more highly, do that. Because the actor is deterministic (one exact output per state, not a distribution to sample from), DDPG can't use $\varepsilon$-greedy exploration the way DQN does — instead, noise is added directly to the actor's output during training.
+
+\section{MDP formalization}
+\label{sec:mdp}
+
+With that background in place, the autoscaling problem is formalized as a full Markov Decision Process, $\mathcal{M} = \langle \mathcal{S}, \mathcal{A}, \mathcal{P}, \mathcal{R}, \gamma \rangle$.
+
+\subsection{State space}
+
+A single snapshot of the current load can't tell you whether things are getting worse or getting better — the same reason the original DQN paper \cite{mnih2015} stacked four consecutive Atari frames instead of feeding in one still image. The state here uses a short rolling window of recent load readings instead:
+\begin{equation}
+s_t = (L_{t-k:t},\ \lambda_t,\ C_t,\ N_t)
+\end{equation}
+where $L_t$ is incoming load, $\lambda_t$ is observed latency, $C_t$ is CPU utilization, and $N_t$ is the current replica count. Two extensions were considered but not implemented in the final version: memory utilization $M_t$ (relevant if the workload were memory-bound rather than CPU-bound, which this one isn't), and a cyclical time-of-day encoding,
+\begin{equation}
+\text{hour\_sin} = \sin\!\left(\frac{2\pi \cdot \text{hour}}{24}\right), \qquad
+\text{hour\_cos} = \cos\!\left(\frac{2\pi \cdot \text{hour}}{24}\right)
+\end{equation}
+which would let the agent anticipate known daily traffic patterns rather than only reacting to them. The sin/cos pair avoids the discontinuity a raw hour number would introduce — without it, hour 23 and hour 0 look numerically far apart to a neural network despite being an hour apart in reality.
+
+\subsection{Action space}
+\label{sec:action-space}
+
+Two competing framings were worked through for the continuous case, and the choice between them turned out to matter more than I initially expected.
+
+In the \textbf{delta framing}, the action is a change relative to the current replica count:
+\begin{equation}
+\mathcal{A}_{\text{DQN}} = \{-2,-1,0,+1,+2\}, \qquad a_t \in [-\Delta_{\max}, +\Delta_{\max}] \text{ (continuous)}
+\end{equation}
+\begin{equation}
+N_{t+1} = \text{clip}(N_t + \text{round}(a_t),\ N_{\min},\ N_{\max})
+\end{equation}
+In the \textbf{absolute framing}, the action is directly the target replica count:
+\begin{equation}
+N_{t+1} = \text{clip}(\text{round}(a_t),\ N_{\min},\ N_{\max})
+\end{equation}
+
+The practical difference shows up during a sudden spike. Say the ideal response is to jump from 3 replicas to 9 in one step. Under delta framing with $\Delta_{\max}=3$, the actor physically cannot do that in a single step — it has to go $3 \to 6 \to 9$, reacting one step slower than the situation calls for. Under absolute framing, it just outputs 9 directly. I ended up implementing and evaluating both (registered as separate environments, \texttt{AutoscalingContinuous-v0} for absolute and \texttt{AutoscalingContinuousDelta-v0} for delta), which is what produced the "PPO (discrete)" versus "PPO (delta)" split visible in the results.
+
+\subsection{Reward function}
+\label{sec:reward}
+
+\begin{equation}
+r_t = -\Big(\alpha \cdot \text{SLA\_violation}(\lambda_t) + \beta \cdot \text{cost}(N_t) + \gamma_{\text{stab}} \cdot |\Delta N_t|\Big)
+\end{equation}
+
+\begin{table}[h]
+\centering
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Term} & \textbf{Formula} & \textbf{Purpose} \\
+\midrule
+SLA violation & $\max(0, \lambda_t - \lambda_{\text{target}})$ & Penalizes exceeding the latency target, scaled by how badly \\
+Cost & $N_t$ & Penalizes running more pods than necessary \\
+Stability & $|\Delta N_t|$ & Penalizes frequent or abrupt replica changes (thrashing) \\
+\bottomrule
+\end{tabularx}
+\caption{Reward components}
+\end{table}
+
+Why bother with a stability term at all, given that neither SLA nor cost directly measures it? Because every real scaling action has overhead the other two terms don't capture — a new pod needs to be scheduled and pass readiness checks before it's useful, and a removed one needs its in-flight connections drained. A policy with no stability penalty has no reason to prefer a calm, steady replica count over one that jitters up and down chasing every small fluctuation in load, and that jittering is genuinely disruptive in a real cluster even when each individual step looks harmless in isolation.
+
+I went with one combined reward rather than Shukla's approach of three separate single-objective agents, mainly because it lets the SLA/cost/stability trade-off be studied directly through the weights $(\alpha, \beta, \gamma_{\text{stab}})$ on a single policy, instead of having to choose among three agents that were never trained against each other's objectives.
+
+\subsection{Discount factor and episode structure}
+
+$\gamma = 0.99$, matching the original DQN paper \cite{mnih2015}, so the agent weighs consequences meaningfully out to a hundred-plus steps rather than only the next few. This matters here specifically because over-provisioning now keeps quietly costing reward for every subsequent step it persists — a smaller $\gamma$ would let the agent effectively ignore that slow-building cost.
+
+An episode is one simulated day (200 timesteps), rather than an arbitrary fixed length, so the agent experiences complete daily cycles repeatedly during training. Days 11--14 of the Azure trace are held out from training entirely and used only for evaluation — the standard train/test split, applied here so that any reported real-data result reflects generalization rather than memorization of the specific days trained on.
+
+% ============================================================
+\chapter{Implementation}
+\label{chap:impl}
+
+\section{Repository structure}
+
+\begin{table}[h]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Path} & \textbf{Purpose} \\
+\midrule
+\texttt{envs/autoscaling\_env.py} & Gymnasium simulator (both discrete and continuous variants) \\
+\texttt{envs/data\_loader.py} & Azure trace loading and rescaling \\
+\texttt{agents/train\_dqn*.py} & DQN training (synthetic, real data, low-stability variant) \\
+\texttt{agents/train\_ddpg*.py} & DDPG training (initial and tuned) \\
+\texttt{baselines/hpa\_policy.py} & Faithful HPA formula, same bounds as the RL agents \\
+\texttt{evaluation/evaluate*.py} & Fixed-seed multi-policy evaluation \\
+\texttt{evaluation/plots.py} & Comparison figures \\
+\texttt{models/}, \texttt{logs/} & Trained weights and TensorBoard logs \\
+\bottomrule
+\end{tabularx}
+\caption{Repository layout}
+\end{table}
+
+\section{The simulation environment}
+
+The environment follows the standard Gymnasium contract (\texttt{reset()}, \texttt{step(action)}), which is what lets any Stable-Baselines3 algorithm plug into it without custom glue code.
+
+\subsection{Synthetic load, first}
+
+Before touching real data, load was generated synthetically, as a noisy sine wave standing in for a daily traffic cycle:
+\begin{lstlisting}[language=Python]
+def _generate_load(self, t):
+    base = 500 + 400 * np.sin(2 * np.pi * t / self.episode_length)
+    noise = np.random.normal(0, 20)
+    return max(0, base + noise)
+\end{lstlisting}
+The reasoning for starting here rather than with real data immediately: if something went wrong once training began, I wanted to be able to rule out "the data is weird" as a cause before debugging the agent itself. That turned out to be the right call almost immediately.
+
+\subsection{Latency model and a bug I didn't expect}
+
+Latency is modeled to grow sharply as utilization approaches saturation, which is at least directionally consistent with how real queueing systems behave:
+\begin{lstlisting}[language=Python]
+def _compute_latency_cpu(self, load, replicas):
+    capacity_per_pod = 150
+    total_capacity = replicas * capacity_per_pod
+    utilization = load / total_capacity
+    cpu = min(100, utilization * 100)
+    latency = 50 / max(0.01, (1 - min(utilization, 0.99)))
+    latency = min(latency, 1000)
+    return latency, cpu
+\end{lstlisting}
+The \texttt{min(latency, 1000)} cap and the \texttt{capacity\_per\_pod=150} value weren't there in the first version. A random-policy sanity run — just to confirm nothing crashed before wiring up any real agent — instead produced an average episode reward around $-38{,}900$, and it took a bit of digging to realize why: with capacity barely above peak load and no cap on latency, utilization could sit near 1.0 for long stretches, and the latency formula would blow up toward several thousand milliseconds, producing single-step penalties around $-4800$. I fixed this the same way the DQN paper handles unbounded rewards — capping the raw latency, clipping the final reward to $[-50,+50]$, and giving the environment enough spare capacity that even a mediocre policy has some margin. After the fix, the same random policy landed around $-4120$ per episode, which is a far more sane number to treat as a baseline.
+
+\section{DQN}
+
+Trained via Stable-Baselines3's \texttt{DQN} with an \texttt{MlpPolicy} — a small dense network is enough here, since the state is an 8-number vector rather than an image, so there's no need for the convolutional layers the original Atari-playing DQN used.
+
+\begin{lstlisting}[language=Python]
+model = DQN(
+    "MlpPolicy", env,
+    learning_rate=1e-3, buffer_size=50_000,
+    target_update_interval=500, exploration_fraction=0.3,
+    verbose=1, tensorboard_log="./logs/dqn/",
+)
+model.learn(total_timesteps=100_000)
+\end{lstlisting}
+
+On the synthetic environment, the training curve climbed steadily from about $-4190$ at episode 4 to a stable plateau around $-880$ by episode 500 — the kind of clean, monotonic-then-flat curve that suggests the replay buffer and target network are doing their job, rather than the noisier, oscillating pattern you'd expect if something in the training loop were broken.
+
+\section{DDPG: a first failure, then a fix}
+\label{sec:ddpg-collapse}
+
+The first DDPG run, with fairly standard default hyperparameters (\texttt{sigma=1.0} exploration noise, no observation or reward normalization), collapsed into a degenerate policy. On the synthetic environment it converged to always outputting the minimum replica count — cost summed to exactly 400 over 200 steps, meaning a constant 2 replicas the whole episode, with SLA violations far worse than even a random policy. On real data the same run collapsed the other way, pinned permanently at the maximum replica count, giving zero SLA violations purely by massively over-provisioning and never adjusting again.
+
+Getting past this took several changes together, and I can't say for certain which single one mattered most, though I'd guess normalization did the heaviest lifting: wrapping the environment in \texttt{VecNormalize} to normalize both observations and rewards, lowering the exploration noise ($\sigma$: 1.0 $\to$ 0.35), reducing the learning rate ($10^{-3} \to 3\times10^{-4}$), delaying the start of training until the replay buffer had 5000 transitions in it, and widening the network to two 128-unit hidden layers. The corrected agent's results are reported in Chapter~\ref{chap:results} as "DDPG (tuned)," and the difference between the two versions is large enough that I think the collapse-and-fix story is worth including in full rather than just quietly reporting the better number.
+
+\section{HPA baseline}
+
+The real HPA formula was reimplemented directly, with the same replica bounds used by every RL agent, so the comparison is apples-to-apples:
+\begin{lstlisting}[language=Python]
+class HPAPolicy:
+    def act(self, current_replicas, current_cpu_pct):
+        current_utilization = current_cpu_pct / 100.0
+        desired = np.ceil(current_replicas * (current_utilization / self.target_utilization))
+        return int(np.clip(desired, self.n_min, self.n_max))
+\end{lstlisting}
+
+\section{Real data: the Azure Functions Dataset}
+
+The Azure Functions Dataset 2019 \cite{azurefunctions}, a public trace of per-minute invocation counts published by Microsoft, was used to test whether anything learned on the synthetic sine wave actually transferred to real traffic. Each of the 14 daily files is summed across functions to get one aggregate load signal per minute, bin-averaged from 1440 minutes down to the environment's 200-step episode length, then rescaled into the 100--900 range the latency model was tuned around. Days 1--10 are used for training, days 11--14 held out for evaluation only.
+
+\section{Additional algorithms}
+
+Once the DDPG-versus-HPA gap on real data turned out to be substantial even after fixing the collapse, it seemed worth checking whether that gap was specific to DDPG or a broader pattern. SAC, TD3, and PPO (in both action framings) were added to the comparison for that reason — this goes beyond what the internship proposal asked for, and I've tried to flag it as such rather than present it as if it were planned from the start.
+
+% ============================================================
+\chapter{Results and Discussion}
+\label{chap:results}
+
+Every policy below is evaluated on the same 20 fixed-seed episodes, with four metrics tracked separately rather than folded into one score: \textbf{reward} (total episode score, higher/less negative is better), \textbf{SLA violation} (summed milliseconds of latency above the 200\,ms threshold), \textbf{cost} (summed replica count, a proxy for spend), and \textbf{churn} (total number of replica changes, a proxy for instability).
+
+\section{Synthetic environment}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Policy} & \textbf{Reward} & \textbf{SLA viol.} & \textbf{Cost} & \textbf{Churn} \\
+\midrule
+Random          & $-3842.6$ & $44591.4$  & $1173.1$ & $195.5$ \\
+DQN             & $-744.6$  & $363.9$    & $1241.3$ & $24.8$ \\
+HPA             & $-718.2$  & $189.3$    & $1323.8$ & $44.4$ \\
+DDPG (initial)  & $-7369.0$ & $111228.7$ & $400.0$  & $0.0$ \\
+DDPG (tuned)    & $-628.9$  & $205.0$    & $1113.0$ & $70.8$ \\
+\bottomrule
+\end{tabular}
+\caption{Synthetic environment comparison}
+\end{table}
+
+DQN and HPA land close together here. The initial DDPG's collapse is visible directly in the numbers — zero churn means it never once changed the replica count for the entire episode. The tuned DDPG comes out ahead of everything else, including HPA, on this environment.
+
+\section{Real data (Azure, held-out)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Policy} & \textbf{Reward} & \textbf{SLA viol.} & \textbf{Cost} & \textbf{Churn} \\
+\midrule
+Random                        & $-3548.8$ & $40265.0$ & $1173.1$ & $195.5$ \\
+DQN ($\gamma_{\text{stab}}{=}0.3$) & $-1406.8$ & $5178.6$  & $1050.5$ & $109.9$ \\
+HPA                           & $-840.2$  & $1092.7$  & $1287.0$ & $187.8$ \\
+DQN ($\gamma_{\text{stab}}{=}0.1$) & $-932.5$  & $1444.0$  & $1351.8$ & $325.6$ \\
+DDPG (initial)                & $-1000.8$ & $0.0$     & $2000.0$ & $8.0$ \\
+DDPG (tuned)                  & $-744.6$  & $717.7$   & $1265.2$ & $173.2$ \\
+SAC                           & $-702.9$  & $452.6$   & $1250.6$ & $146.0$ \\
+TD3                           & $-733.2$  & $598.8$   & $1259.5$ & $168.2$ \\
+PPO (discrete)                & $-739.9$  & $527.9$   & $1296.5$ & $215.2$ \\
+PPO (delta)                   & $-740.2$  & $507.7$   & $1318.6$ & $192.2$ \\
+\bottomrule
+\end{tabular}
+\caption{Real-data comparison (Azure days 11--14, held-out)}
+\end{table}
+
+\subsection{A reversal I didn't expect}
+
+On synthetic data, DQN and HPA were nearly tied. On real data, HPA pulls well ahead of the baseline DQN — SLA violations rise more than 20$\times$ for DQN against roughly 5$\times$ for HPA over the same transition. Real Azure traffic has sharp, irregular spikes that look nothing like the smooth sine wave the agent trained its intuitions on, and it seems HPA's dumb-but-robust reactive rule copes with that better than a policy that learned mostly from a repetitive, predictable pattern.
+
+Churn tells the opposite story, and this is the detail that made me want to dig further rather than just report the gap and move on. HPA's churn nearly quadruples on real data ($44.8 \to 187.8$) while DQN's actually drops ($183.2 \to 109.9$). HPA reacts mechanically to every fluctuation in CPU, so sharper real-world spikes make it thrash more. DQN, having learned a policy rather than following a fixed rule, shows more restraint even in the harder setting — just not enough urgency to avoid the SLA cost that restraint incurs.
+
+\subsection{Testing the hypothesis: lowering $\gamma_{\text{stab}}$}
+\label{sec:gamma-stab}
+
+If the stability weight, tuned through experimentation on the smooth synthetic signal, was making the agent too cautious to react to sharp real spikes, then lowering it should let the agent respond faster, at some cost to churn. A second DQN was retrained on the same 10 training days with $\gamma_{\text{stab}}$ reduced from 0.3 to 0.1, everything else held fixed.
+
+It worked, more or less as predicted. Reward improved from $-1406.8$ to $-932.5$, closing about 80\% of the gap to HPA. SLA violations dropped from $5178.6$ to $1444.0$ — roughly a 3.6$\times$ reduction. The cost was exactly what you'd expect: churn rose sharply, from $109.9$ to $325.6$, now well above HPA's own churn. This is a clean result in the sense that it isolates one variable and the outcome moves in the predicted direction on the predicted metrics — but it's also only a partial fix. The gap to HPA narrowed substantially without closing entirely, which suggests $\gamma_{\text{stab}}$ is a real lever but not the whole story; something about the training exposure itself (more training on volatile real days, rather than mostly smoother ones) might account for the rest.
+
+\subsection{The wider comparison}
+\label{sec:benchmark}
+
+This is where things got more interesting than I'd planned for. Ranked by reward on real data:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{clr}
+\toprule
+\textbf{Rank} & \textbf{Policy} & \textbf{Reward} \\
+\midrule
+1 & SAC & $-702.9$ \\
+2 & TD3 & $-733.2$ \\
+3 & PPO (discrete) & $-739.9$ \\
+4 & PPO (delta) & $-740.2$ \\
+5 & DDPG (tuned) & $-744.6$ \\
+6 & HPA & $-840.2$ \\
+7 & DQN ($\gamma_{\text{stab}}{=}0.1$) & $-932.5$ \\
+8 & DDPG (initial) & $-1000.8$ \\
+9 & DQN ($\gamma_{\text{stab}}{=}0.3$) & $-1406.8$ \\
+10 & Random & $-3548.8$ \\
+\bottomrule
+\end{tabular}
+\caption{Full ranking, real held-out data}
+\end{table}
+
+Five separate algorithms — SAC, TD3, both PPO variants, and tuned DDPG — beat HPA on real data. Only the two DQN variants and the pre-fix DDPG fall short. SAC in particular doesn't just win on the combined reward; it beats HPA on every individual metric at once (SLA violation less than half of HPA's, cost slightly lower, churn lower too), which is a cleaner sweep than I expected to see anywhere in this project.
+
+The honest read on this is that the original DQN-versus-HPA gap wasn't evidence that RL can't handle real-world traffic — it was mostly a DDPG implementation problem (the collapse) and a DQN reward-tuning problem ($\gamma_{\text{stab}}$ set too high for real spikes), neither of which turned out to be fundamental once addressed properly.
+
+\section{Discussion and limitations}
+\label{sec:discussion}
+
+A few things are worth stating plainly rather than glossing over. Every result in this chapter comes from a single trained agent per configuration, evaluated over 20 episodes — not the 20-independent-training-runs-with-paired-t-tests standard Pandey's paper sets. An earlier, smaller sweep over $\gamma_{\text{stab}}$ values (not reported in full here) showed non-monotonic behavior across training seeds, which is a fairly direct signal that a single run per configuration isn't quite enough to trust a result fully — multi-seed training with proper statistical testing is the obvious next step and I'd treat any single-run comparison in this report with that caveat attached.
+
+The comparison is also limited to HPA as the only reactive baseline; VPA and KEDA weren't included, and neither was an explicit predictive (ARIMA/LSTM) baseline, despite that being in the original plan. And the design throughout is single-agent, single-objective — closer to NimbusGuard and Pandey than to KARMA's multi-agent decomposition, which means adversarial scenarios (DDoS, cascading pod failures) aren't modeled at all here.
+
+% ============================================================
+\chapter{Conclusion and Future Work}
+\label{chap:conclusion}
+
+\section{Conclusion}
+
+This internship formalized Kubernetes pod autoscaling as an MDP, built a working simulation and training pipeline for DQN and DDPG (plus SAC, TD3, and PPO, added once the original scope stopped answering the questions that came up), and validated the whole thing on both synthetic and real Azure traffic. The baseline DQN agent learned something real — nearly 5$\times$ better reward than a random policy — but underperformed HPA on real data, a gap that turned out to be largely explainable and partially fixable through the reward's stability weight. DDPG's first attempt collapsed outright; fixing it, mostly through normalization, produced a genuinely strong agent. And the wider algorithm comparison showed that, once properly tuned, several RL approaches do beat HPA on real traffic across every metric tracked — which is a more useful and more honest conclusion than either "RL trivially wins" or "RL doesn't work here" would have been.
+
+\section{Future work}
+\label{sec:future}
+
+A few directions seem like natural next steps, roughly in order of how much effort each would take relative to the payoff. Multi-seed training with paired statistical tests, following Pandey's methodology, would turn the current single-run comparisons into something more defensible. Adding VPA, KEDA, and an actual predictive baseline would round out the comparison the original proposal asked for. Testing generalization on a second real dataset — the Alibaba Cluster Trace is the obvious candidate, since its \texttt{cpu\_util\_percent} column maps almost directly onto this project's state variables — would say something about whether these results are Azure-specific. Further out, actually deploying a trained policy against a real Kubernetes cluster rather than a simulator would be the real test, and a KARMA-style decomposition into specialized agents would be the way to go if adversarial or multi-objective scenarios ever become a requirement rather than a nice-to-have.
+
+\clearpage
+\printbibliography
+
+\end{document}
